@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Any, cast
 from urllib.request import urlopen
@@ -23,6 +24,7 @@ from linebot.v3.messaging import (
     TextMessage,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from FinMind.data import DataLoader
 
 
 # 載入環境變數
@@ -48,7 +50,6 @@ gemini_llm = LLM(
     api_key=os.getenv("GOOGLE_API_KEY"),
 )
 
-from FinMind.data import DataLoader
 
 @tool("fetch_taiwan_chip_data")
 def fetch_taiwan_chip_data(ticker: str):
@@ -66,9 +67,9 @@ def fetch_taiwan_chip_data(ticker: str):
             # 不因登入失敗中斷，僅作紀錄
             print(f"⚠️ FinMind 登入失敗：{e}")
 
-    # 動態設定起始日：抓最近約 120 天的資料
+    # 動態設定起始日：抓最近約 90 天的資料
     end_date = datetime.today().date()
-    start_date = (end_date - timedelta(days=120)).strftime("%Y-%m-%d")
+    start_date = (end_date - timedelta(days=90)).strftime("%Y-%m-%d")
 
     # 1. 抓取三大法人買賣超
     df_chips = dl.taiwan_stock_institutional_investors(
@@ -295,18 +296,24 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
-    """收到使用者文字時，跑一次投資分析並把結果推送回去。"""
+    """收到使用者文字時，立即回覆 Line 伺服器，並在後台跑 AI。"""
     user_text = (getattr(event.message, "text", "") or "").strip()
     stock_target = user_text if user_text else "NVIDIA (NVDA)"
+    
+    # 建立後台執行緒，避免阻塞 Flask
+    def async_analysis():
+        try:
+            # 可以考慮在這裡先 push 一則「分析中...」的訊息給使用者
+            send_line_to_user("分析中...")
+            result = run_investment_analysis(stock_target)
+            send_line_to_user(result)
+        except Exception as e:
+            send_line_to_user(f"分析失敗：{e}")
 
-    print(f"📩 收到使用者訊息: {user_text!r}，開始分析標的: {stock_target}")
-    try:
-        result = run_investment_analysis(stock_target)
-        send_line_to_user(result)
-    except Exception as e:
-        error_msg = f"分析過程發生錯誤：{e}"
-        print(f"❌ {error_msg}")
-        send_line_to_user(error_msg)
+    thread = threading.Thread(target=async_analysis)
+    thread.start()
+
+    return "OK"
 
 
 # --- 4. 透過 ngrok + Flask 在 8000 埠啟動 ---
