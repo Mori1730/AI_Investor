@@ -7,6 +7,9 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any, cast
 from urllib.request import urlopen
+from pandas.core.arrays import boolean
+from waitress import serve
+import re
 
 import yfinance as yf
 from crewai import Agent, Task, Crew, LLM
@@ -25,7 +28,8 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from FinMind.data import DataLoader
-
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # 載入環境變數
 load_dotenv()
@@ -50,6 +54,12 @@ gemini_llm = LLM(
     api_key=os.getenv("GOOGLE_API_KEY"),
 )
 
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "5 per minute"],
+    storage_uri="memory://",
+)
 
 @tool("fetch_taiwan_chip_data")
 def fetch_taiwan_chip_data(ticker: str):
@@ -191,6 +201,7 @@ def run_investment_analysis(stock_target: str) -> str:
             "3) 對數據與新聞中出現的矛盾之處進行解釋與權重評估；"
             "4) 明確說明你的假設與不確定性，避免絕對語氣與無根據的猜測；"
             "5) 最後以『短線/中長線』情境拆解可能路徑與勝率、風報比。"
+            "6) 執行板塊分析。如果目標股票上漲，請檢查同族群的其他股票是否也具備動能（族群性噴發）。如果發現上下游供應鏈（如設備股）領先起漲，你應將此視為強烈的提前佈局訊號。"
             "你非常討厭憑感覺下結論，只信可重複驗證的數據與邏輯推演。"
         ),
         tools=[fetch_taiwan_chip_data, fetch_stock_data, search_tool],
@@ -200,7 +211,7 @@ def run_investment_analysis(stock_target: str) -> str:
 
     risk_agent = Agent(
         role="風控判官 Risk",
-        goal="針對 Alpha 的提案進行壓力測試，找出潛在的利空因素、情境風險與最大虧損範圍。",
+        goal="直接針對 Alpha 的提案進行壓力測試，找出潛在的利空因素、情境風險與最大虧損範圍。",
         backstory=(
             "你是極度紀律的風控總監，專長是拆解過度樂觀的投資故事。"
             "你會系統性地："
@@ -209,6 +220,7 @@ def run_investment_analysis(stock_target: str) -> str:
             "3) 明確量化風險（如合理的回撤區間、停損價位與部位上限），不接受模糊的『應該還好』；"
             "4) 一旦關鍵數據不足或衝突，你會要求保守對待，標註為『資訊不足不建議重倉』；"
             "5) 只有在風報比、資金管理與風險集中度都可接受時，才會給出『通過』決策。"
+            "6) 檢查板塊過熱風險。如果同產業的所有公司 RSI 指標皆超過 70，即便目標公司數據良好，你也要警告可能存在集體回撤的風險。同時注意地緣政治對特定板塊（如半導體）的衝擊。"
             "你的首要任務是避免大虧損，而不是追求最大報酬。"
         ),
         tools=[fetch_taiwan_chip_data, fetch_stock_data, search_tool],
@@ -279,8 +291,8 @@ def send_line_to_user(content: str):
 
 # --- 3. Line Webhook + Flask 路由設定 ---
 
-
 @app.route("/callback", methods=["POST"])
+@limiter.limit("5 per minute")
 def callback():
     """Line Webhook 入口，由 ngrok 對外暴露。"""
     signature = request.headers.get("X-Line-Signature", "")
@@ -293,13 +305,20 @@ def callback():
 
     return "OK"
 
+def is_safe_ticker(ticker: str) -> bool:
+    """防止注入攻擊"""
+    return bool(re.match(r"^[A-Z0-9.\-]{1,10}$", ticker))
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
-    """收到使用者文字時，立即回覆 Line 伺服器，並在後台跑 AI。"""
-    user_text = (getattr(event.message, "text", "") or "").strip()
-    stock_target = user_text if user_text else "NVIDIA (NVDA)"
+    user_text = (getattr(event.message, "text", "") or "").strip().upper()
     
+    # 安全檢查
+    if not is_safe_ticker(user_text):
+        send_line_to_user("⚠️ 請輸入正確的股票代碼格式（例如: NVDA 或 2330）。")
+        return
+    
+    stock_target = user_text if user_text else "NVDA"
     # 建立後台執行緒，避免阻塞 Flask
     def async_analysis():
         try:
@@ -402,4 +421,5 @@ if __name__ == "__main__":
             "- 你也可以改成手動執行 `ngrok http 8000`，然後把網址填到 `<public>/callback`"
         )
 
-    app.run(host="0.0.0.0", port=port)
+    print(f"🚀 Waitress 已啟動，監聽埠號: {port}")
+    serve(app, host='0.0.0.0', port=port, threads=4)
