@@ -1,5 +1,6 @@
 練習使用Gemini API/Serper API/LineBot API/ngrok/flask
-Env:
+
+ENV:
 Anaconda Python=3.13.12
 
 使用步驟：
