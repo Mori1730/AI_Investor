@@ -9,7 +9,11 @@ from typing import Any, cast
 from urllib.request import urlopen
 from pandas.core.arrays import boolean
 from waitress import serve
+import requests
 import re
+import asyncio
+from mcp.client.sse import sse_client
+from mcp.client.session import ClientSession
 
 import yfinance as yf
 from crewai import Agent, Task, Crew, LLM
@@ -309,27 +313,164 @@ def is_safe_ticker(ticker: str) -> bool:
     """防止注入攻擊"""
     return bool(re.match(r"^[A-Z0-9.\-]{1,10}$", ticker))
 
+async def _mcp_call(tool_name: str, arguments: dict) -> str:
+    mcp_url = os.getenv("MCP_SERVER_URL", "http://localhost:8001/sse")
+    try:
+        async with sse_client(mcp_url) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments)
+                if result.isError:
+                    return f"MCP 執行錯誤: {result.content}"
+                if result.content and len(result.content) > 0:
+                    try:
+                        text_response = result.content[0].text
+                        try:
+                            # 嘗試將回傳的字串解析為 JSON 以美化輸出
+                            parsed_json = json.loads(text_response)
+                            if isinstance(parsed_json, dict):
+                                if "success" in parsed_json and "data" in parsed_json:
+                                    if parsed_json.get("success"):
+                                        parsed_json = parsed_json["data"]
+                                    else:
+                                        return f"MCP 處理失敗: {parsed_json.get('error')}"
+                                
+                            # 將 Dictionary 組裝成好讀的多行文字
+                            field_map = {
+                                "symbol": "股票代碼", "company_name": "公司名稱", "current_price": "目前股價",
+                                "change": "漲跌金額", "change_percent": "漲跌幅", "volume": "成交量",
+                                "high": "最高價", "low": "最低價", "open": "開盤價", "previous_close": "昨收價",
+                                "last_update": "最後更新時間", "trading_stats": "大盤交易統計", "Time": "時間",
+                                "AccBidOrders": "委買筆數", "AccBidVolume": "委買張數", "AccAskOrders": "委賣筆數",
+                                "AccAskVolume": "委賣張數", "AccTransaction": "成交筆數", "AccTradeVolume": "總成交張數",
+                                "AccTradeValue": "成交金額", "count": "資料筆數", "frequency": "更新頻率",
+                            }
+                            
+                            def translate(k): return field_map.get(k, k)
+                            lines = []
+                            for k, v in parsed_json.items():
+                                key_name = translate(k)
+                                if isinstance(v, list) and all(isinstance(i, dict) for i in v) and len(v) > 0:
+                                    lines.append(f"🔹 {key_name}:")
+                                    # 如果是串列清單(例如大盤統計)，逐一列出
+                                    for i, item in enumerate(v):
+                                        time_val = item.get("Time", f"筆數 {i+1}")
+                                        lines.append(f"  🔸 [{time_val}]")
+                                        for sub_k, sub_v in item.items():
+                                            if sub_k == "Time": continue
+                                            lines.append(f"      - {translate(sub_k)}: {sub_v}")
+                                        lines.append("") # 換行分隔
+                                elif isinstance(v, dict):
+                                    lines.append(f"🔹 {key_name}:")
+                                    for sub_k, sub_v in v.items():
+                                        lines.append(f"    - {translate(sub_k)}: {sub_v}")
+                                elif isinstance(v, list):
+                                    lines.append(f"🔹 {key_name}: {', '.join(map(str, v))}")
+                                else:
+                                    if k == "change_percent" and isinstance(v, (int, float)):
+                                        if abs(v) < 1.0: v = f"{v * 100:.2f} %" # 轉換成百分比
+                                        else: v = f"{v:.2f} %"
+                                    lines.append(f"🔹 {key_name}: {v}")
+                            return "\n".join(lines).strip()
+                            
+                        except json.JSONDecodeError:
+                            return text_response 
+                    except AttributeError:
+                        pass
+                return str(result.content)
+    except Exception as e:
+        return f"無法連線到 MCP Server ({mcp_url}) 或發生內部錯誤：\n{e}\n\n請確認 MCP Server 已經啟動在 8001 port。"
+
+def call_mcp_tool(tool_name: str, arguments: dict) -> str:
+    """透過官方 MCP SDK 呼叫 CasualMarket MCP Server"""
+    return asyncio.run(_mcp_call(tool_name, arguments))
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
-    user_text = (getattr(event.message, "text", "") or "").strip().upper()
+    user_text = (getattr(event.message, "text", "") or "").strip()
     
-    # 安全檢查
-    if not is_safe_ticker(user_text):
-        send_line_to_user("⚠️ 請輸入正確的股票代碼格式（例如: NVDA 或 2330）。")
-        return
-    
-    stock_target = user_text if user_text else "NVDA"
-    # 建立後台執行緒，避免阻塞 Flask
-    def async_analysis():
-        try:
-            # 可以考慮在這裡先 push 一則「分析中...」的訊息給使用者
-            send_line_to_user("分析中...")
-            result = run_investment_analysis(stock_target)
-            send_line_to_user(result)
-        except Exception as e:
-            send_line_to_user(f"分析失敗：{e}")
+    help_text = (
+        "🤖 AI Investor 小幫手指令：\n\n"
+        "【Agent 深度分析】\n"
+        "🔹 /分析 <代碼> (例: /分析 2330)\n\n"
+        "【MCP 單一功能查詢】\n"
+        "🔹 /股價 <代碼> (例: /股價 2330)\n"
+        "🔹 /營收 <代碼> (例: /營收 2330)\n"
+        "🔹 /買入 <代碼> <數量> (例: /買入 2330 1000)\n"
+        "🔹 /基本面 <代碼> (例: /基本面 2330)\n"
+        "🔹 /大盤 (查詢即時交易統計)"
+    )
 
-    thread = threading.Thread(target=async_analysis)
+    if not user_text.startswith("/"):
+        send_line_to_user(help_text)
+        return "OK"
+
+    parts = user_text.split()
+    command = parts[0].lower()
+    
+    def async_worker():
+        try:
+            if command == "/分析":
+                if len(parts) < 2:
+                    send_line_to_user("⚠️ 請輸入股票代碼，例如：/分析 2330")
+                    return
+                stock_target = parts[1].upper()
+                if not is_safe_ticker(stock_target):
+                    send_line_to_user("⚠️ 股票代碼格式錯誤。")
+                    return
+                send_line_to_user(f"🔍 啟動 Agent 正在深入分析 {stock_target}，請稍候...")
+                result = run_investment_analysis(stock_target)
+                send_line_to_user(result)
+                
+            elif command == "/股價":
+                if len(parts) < 2:
+                    send_line_to_user("⚠️ 請輸入股票代碼，例如：/股價 2330")
+                    return
+                send_line_to_user(f"查詢 {parts[1]} 股價中...")
+                result = call_mcp_tool("get_taiwan_stock_price", {"symbol": parts[1]})
+                send_line_to_user(result)
+                
+            elif command == "/營收":
+                if len(parts) < 2:
+                    send_line_to_user("⚠️ 請輸入股票代碼，例如：/營收 2330")
+                    return
+                send_line_to_user(f"查詢 {parts[1]} 營收中...")
+                result = call_mcp_tool("get_company_monthly_revenue", {"symbol": parts[1]})
+                send_line_to_user(result)
+
+            elif command == "/買入":
+                if len(parts) < 3:
+                    send_line_to_user("⚠️ 請輸入格式：/買入 <代碼> <數量>，例如：/買入 2330 1000")
+                    return
+                try:
+                    qty = int(parts[2])
+                except ValueError:
+                    send_line_to_user("⚠️ 數量必須為整數。")
+                    return
+                send_line_to_user(f"處理模擬買入 {parts[1]} ({qty}股)...")
+                result = call_mcp_tool("buy_taiwan_stock", {"symbol": parts[1], "quantity": qty})
+                send_line_to_user(result)
+                
+            elif command == "/基本面":
+                if len(parts) < 2:
+                    send_line_to_user("⚠️ 請輸入股票代碼，例如：/基本面 2330")
+                    return
+                send_line_to_user(f"查詢 {parts[1]} 基本面中...")
+                result = call_mcp_tool("get_company_profile", {"symbol": parts[1]})
+                send_line_to_user(result)
+
+            elif command == "/大盤":
+                send_line_to_user("查詢大盤數據中...")
+                result = call_mcp_tool("get_real_time_trading_stats", {})
+                send_line_to_user(result)
+
+            else:
+                send_line_to_user(f"⚠️ 找不到指令 '{command}'。\n\n{help_text}")
+
+        except Exception as e:
+            send_line_to_user(f"❌ 執行失敗：{e}")
+
+    thread = threading.Thread(target=async_worker)
     thread.start()
 
     return "OK"
